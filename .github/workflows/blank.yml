@@ -1,0 +1,1183 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made upname: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FineMap-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "uz.finemap.offline"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "uz.finemap.offline"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "0.1.0-alpha"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
+    implementation("org.maplibre.gl:android-sdk:13.7.1")
+}
+
+package uz.finemap.offline
+
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.net.Uri
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.provider.Settings
+import android.view.View
+import android.widget.EditText
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import org.json.JSONArray
+import org.json.JSONObject
+import org.maplibre.android.MapLibre
+import org.maplibre.android.camera.CameraPosition
+import org.maplibre.android.camera.CameraUpdateFactory
+import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.maps.MapView
+import org.maplibre.android.maps.MapLibreMap
+import org.maplibre.android.style.layers.CircleLayer
+import org.maplibre.android.style.layers.PropertyFactory.circleColor
+import org.maplibre.android.style.layers.PropertyFactory.circleRadius
+import org.maplibre.android.style.layers.PropertyFactory.circleStrokeColor
+import org.maplibre.android.style.layers.PropertyFactory.circleStrokeWidth
+import org.maplibre.android.style.sources.GeoJsonSource
+import java.io.File
+import java.util.Locale
+import java.util.concurrent.Executors
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var mapView: MapView
+    private var map: MapLibreMap? = null
+    private var selectedProject = "Olmaliq shahri"
+    private var layers = mutableListOf<ImportedLayer>()
+    private var currentLocation: Location? = null
+    private var locationManager: LocationManager? = null
+    private var shouldTrackLocation = false
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+
+    private lateinit var tvMapStatus: TextView
+    private lateinit var tvProjectName: TextView
+    private lateinit var tvProjectPath: TextView
+    private lateinit var tvLayerCountBadge: TextView
+    private lateinit var tvGpsStatus: TextView
+    private lateinit var tvCoordinates: TextView
+    private lateinit var tvAccuracy: TextView
+    private lateinit var viewGpsDot: View
+
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val fine = result[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        val coarse = result[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (fine || coarse) {
+            startGps()
+        } else {
+            updateGpsUi(false, "Joylashuv ruxsati berilmadi")
+            Toast.makeText(this, "GPS uchun joylashuv ruxsati kerak", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private val rasterPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { importLayer(it, ImportKind.RASTER) }
+    }
+
+    private val dxfPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { importLayer(it, ImportKind.DXF) }
+    }
+
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            currentLocation = location
+            runOnUiThread {
+                updateGpsUi(true, "GPS joylashuv topildi")
+                tvCoordinates.text = String.format(
+                    Locale.US,
+                    "Lat %.6f   ·   Lon %.6f",
+                    location.latitude,
+                    location.longitude
+                )
+                tvAccuracy.text = if (location.hasAccuracy()) {
+                    String.format(Locale.US, "± %.1f m", location.accuracy)
+                } else {
+                    "Aniqlik: —"
+                }
+                moveMapToLocation(location, zoom = 16.0)
+                updateLocationMarker(location)
+            }
+        }
+
+        @Deprecated("Deprecated by Android, still used for older location callback compatibility")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
+        override fun onProviderEnabled(provider: String) = Unit
+        override fun onProviderDisabled(provider: String) {
+            runOnUiThread { updateGpsUi(false, "GPS o‘chirilgan") }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        MapLibre.getInstance(this)
+        setContentView(R.layout.activity_main)
+
+        selectedProject = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString("current_project", "Olmaliq shahri") ?: "Olmaliq shahri"
+
+        mapView = findViewById(R.id.mapView)
+        tvMapStatus = findViewById(R.id.tvMapStatus)
+        tvProjectName = findViewById(R.id.tvProjectName)
+        tvProjectPath = findViewById(R.id.tvProjectPath)
+        tvLayerCountBadge = findViewById(R.id.tvLayerCountBadge)
+        tvGpsStatus = findViewById(R.id.tvGpsStatus)
+        tvCoordinates = findViewById(R.id.tvCoordinates)
+        tvAccuracy = findViewById(R.id.tvAccuracy)
+        viewGpsDot = findViewById(R.id.viewGpsDot)
+
+        mapView.onCreate(savedInstanceState)
+        mapView.getMapAsync { mapInstance ->
+            map = mapInstance
+            mapInstance.cameraPosition = CameraPosition.Builder()
+                .target(LatLng(40.8448, 69.5983)) // Olmaliq shahri — boshlang‘ich ko‘rinish
+                .zoom(12.0)
+                .build()
+            mapInstance.setStyle("https://tiles.openfreemap.org/styles/liberty") {
+                tvMapStatus.text = "Onlayn bazaviy xarita · offline rejim keyingi bosqichda"
+                currentLocation?.let { updateLocationMarker(it) }
+            }
+        }
+
+        findViewById<View>(R.id.cardArea).setOnClickListener { showProjectPicker() }
+        findViewById<View>(R.id.btnGps).setOnClickListener { startGps() }
+        findViewById<View>(R.id.btnImport).setOnClickListener { showImportPicker() }
+        findViewById<View>(R.id.btnLayers).setOnClickListener { showLayersDialog() }
+
+        loadLayersForProject()
+        updateProjectUi()
+        updateGpsUi(false, "GPS hali yoqilmagan")
+    }
+
+    private fun showProjectPicker() {
+        val choices = arrayOf(
+            "Olmaliq shahri — demo hudud",
+            "Yangi loyiha yaratish"
+        )
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Loyiha / hudud tanlash")
+            .setItems(choices) { _, which ->
+                when (which) {
+                    0 -> selectProject("Olmaliq shahri")
+                    1 -> showCreateProjectDialog()
+                }
+            }
+            .setNegativeButton("Bekor qilish", null)
+            .show()
+    }
+
+    private fun showCreateProjectDialog() {
+        val input = EditText(this).apply {
+            hint = "Masalan: Yangi kon uchastkasi"
+            setSingleLine(true)
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Yangi loyiha")
+            .setMessage("Loyiha nomini kiriting. Hudud chegarasi va koordinata tizimini keyingi bosqichda sozlaymiz.")
+            .setView(input)
+            .setPositiveButton("Yaratish") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotBlank()) selectProject(name)
+                else Toast.makeText(this, "Loyiha nomini kiriting", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Bekor qilish", null)
+            .show()
+    }
+
+    private fun selectProject(name: String) {
+        selectedProject = name
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString("current_project", name).apply()
+        loadLayersForProject()
+        updateProjectUi()
+        if (name.contains("Olmaliq", ignoreCase = true)) {
+            map?.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(40.8448, 69.5983), 12.0))
+        }
+    }
+
+    private fun updateProjectUi() {
+        tvProjectName.text = selectedProject
+        tvProjectPath.text = if (selectedProject.contains("Olmaliq", ignoreCase = true)) {
+            "O‘zbekiston · Toshkent viloyati · ${layers.size} qatlam"
+        } else {
+            "Mahalliy loyiha · ${layers.size} qatlam"
+        }
+        tvLayerCountBadge.text = "${layers.size} QATLAM"
+    }
+
+    private fun showImportPicker() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Ma’lumot import qilish")
+            .setItems(arrayOf("Aerofotosyomka  (.tif, .tiff, .ecw)", "Poligonlar  (.dxf)")) { _, which ->
+                when (which) {
+                    0 -> rasterPicker.launch(arrayOf("*/*"))
+                    1 -> dxfPicker.launch(arrayOf("*/*"))
+                }
+            }
+            .setNegativeButton("Bekor qilish", null)
+            .show()
+    }
+
+    private fun importLayer(uri: Uri, kind: ImportKind) {
+        val displayName = getDisplayName(uri) ?: "import_${System.currentTimeMillis()}"
+        val lowerName = displayName.lowercase(Locale.ROOT)
+        val extensionValid = when (kind) {
+            ImportKind.RASTER -> lowerName.endsWith(".tif") || lowerName.endsWith(".tiff") || lowerName.endsWith(".ecw")
+            ImportKind.DXF -> lowerName.endsWith(".dxf")
+        }
+        if (!extensionValid) {
+            val expected = if (kind == ImportKind.RASTER) ".tif, .tiff yoki .ecw" else ".dxf"
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Format mos emas")
+                .setMessage("Tanlangan fayl: $displayName\nKutilgan format: $expected")
+                .setPositiveButton("Tushunarli", null)
+                .show()
+            return
+        }
+
+        val projectAtImport = selectedProject
+        Toast.makeText(this, "Fayl loyihaga ko‘chirilmoqda…", Toast.LENGTH_SHORT).show()
+        ioExecutor.execute {
+            try {
+                val parent = getExternalFilesDir(null) ?: filesDir
+                val projectDirectory = File(parent, "projects/${safeFileName(projectAtImport)}/imports")
+                if (!projectDirectory.exists() && !projectDirectory.mkdirs()) {
+                    throw IllegalStateException("Loyiha papkasini yaratib bo‘lmadi")
+                }
+                val safeName = safeFileName(displayName)
+                val destination = File(projectDirectory, "${System.currentTimeMillis()}_$safeName")
+                contentResolver.openInputStream(uri).use { input ->
+                    if (input == null) throw IllegalStateException("Faylni ochib bo‘lmadi")
+                    destination.outputStream().buffered().use { output -> input.copyTo(output) }
+                }
+                val fileType = if (kind == ImportKind.DXF) "DXF poligon" else "Aerofotosyomka"
+                val item = ImportedLayer(displayName, fileType, destination.absolutePath, destination.length())
+                runOnUiThread {
+                    if (selectedProject == projectAtImport) {
+                        layers.add(item)
+                        persistLayersForProject()
+                        updateProjectUi()
+                    } else {
+                        persistLayerToProject(projectAtImport, item)
+                    }
+                    MaterialAlertDialogBuilder(this)
+                        .setTitle("Import saqlandi")
+                        .setMessage(
+                            "$displayName\n\nHajmi: ${formatBytes(destination.length())}\nLoyiha: $projectAtImport\n\nHozirgi prototip faylni telefonda saqlaydi. Uni xaritada qatlam sifatida chizish, koordinata tizimini tekshirish va poligon ichidaligini hisoblash keyingi GIS bosqichida qo‘shiladi."
+                        )
+                        .setPositiveButton("OK", null)
+                        .show()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    MaterialAlertDialogBuilder(this)
+                        .setTitle("Import amalga oshmadi")
+                        .setMessage(e.localizedMessage ?: "Faylni o‘qishda noma’lum xatolik yuz berdi.")
+                        .setPositiveButton("OK", null)
+                        .show()
+                }
+            }
+        }
+    }
+
+    private fun showLayersDialog() {
+        if (layers.isEmpty()) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Loyiha qatlamlari")
+                .setMessage("Hozircha qatlam import qilinmagan. “Import” tugmasi orqali GeoTIFF/TIFF, ECW yoki DXF fayl tanlang.")
+                .setPositiveButton("Import qilish") { _, _ -> showImportPicker() }
+                .setNegativeButton("Yopish", null)
+                .show()
+            return
+        }
+
+        val message = layers.mapIndexed { index, layer ->
+            "${index + 1}. ${layer.name}\n   ${layer.type} · ${formatBytes(layer.sizeBytes)}"
+        }.joinToString("\n\n")
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Qatlamlar · ${layers.size}")
+            .setMessage(message)
+            .setPositiveButton("Yana import") { _, _ -> showImportPicker() }
+            .setNegativeButton("Yopish", null)
+            .show()
+    }
+
+    private fun startGps() {
+        shouldTrackLocation = true
+        val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted && !coarseGranted) {
+            locationPermissionLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ))
+            return
+        }
+
+        val manager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        locationManager = manager
+        val gpsEnabled = try { manager.isProviderEnabled(LocationManager.GPS_PROVIDER) } catch (_: Exception) { false }
+        if (!gpsEnabled) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle("GPS yoqilmagan")
+                .setMessage("Joriy joylashuvni xaritada ko‘rish uchun telefon sozlamalarida Location/GPS ni yoqing.")
+                .setPositiveButton("Sozlamalarni ochish") { _, _ ->
+                    startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                }
+                .setNegativeButton("Keyinroq", null)
+                .show()
+            updateGpsUi(false, "GPS yoqilishini kutmoqda")
+            return
+        }
+
+        try {
+            updateGpsUi(false, "GPS signali qidirilmoqda…")
+            val last = try { manager.getLastKnownLocation(LocationManager.GPS_PROVIDER) } catch (_: SecurityException) { null }
+            if (last != null) {
+                currentLocation = last
+                tvCoordinates.text = String.format(Locale.US, "Lat %.6f   ·   Lon %.6f", last.latitude, last.longitude)
+                tvAccuracy.text = if (last.hasAccuracy()) String.format(Locale.US, "± %.1f m", last.accuracy) else "Aniqlik: —"
+                moveMapToLocation(last, zoom = 15.0)
+                updateLocationMarker(last)
+            }
+            manager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1500L, 1f, locationListener)
+        } catch (e: SecurityException) {
+            updateGpsUi(false, "GPS ruxsati mavjud emas")
+        } catch (e: Exception) {
+            updateGpsUi(false, "GPS ishga tushmadi")
+            Toast.makeText(this, e.localizedMessage ?: "GPS bilan bog‘liq xato", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun updateGpsUi(active: Boolean, status: String) {
+        tvGpsStatus.text = status
+        viewGpsDot.setBackgroundResource(if (active) R.drawable.gps_dot_on else R.drawable.gps_dot_off)
+        if (!active && currentLocation == null) tvAccuracy.text = "Aniqlik: —"
+    }
+
+    private fun moveMapToLocation(location: Location, zoom: Double) {
+        map?.animateCamera(
+            CameraUpdateFactory.newLatLngZoom(LatLng(location.latitude, location.longitude), zoom)
+        )
+    }
+
+    private fun updateLocationMarker(location: Location) {
+        map?.getStyle { style ->
+            val data = """{"type":"Feature","geometry":{"type":"Point","coordinates":[${location.longitude},${location.latitude}]},"properties":{}}"""
+            val source = style.getSourceAs<GeoJsonSource>(LOCATION_SOURCE_ID)
+            if (source == null) {
+                style.addSource(GeoJsonSource(LOCATION_SOURCE_ID, data))
+                style.addLayer(
+                    CircleLayer(LOCATION_LAYER_ID, LOCATION_SOURCE_ID).withProperties(
+                        circleRadius(8f),
+                        circleColor("#1677FF"),
+                        circleStrokeColor("#FFFFFF"),
+                        circleStrokeWidth(2.5f)
+                    )
+                )
+            } else {
+                source.setGeoJson(data)
+            }
+        }
+    }
+
+    private fun getDisplayName(uri: Uri): String? {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) return cursor.getString(index)
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')
+    }
+
+    private fun loadLayersForProject() {
+        layers = mutableListOf()
+        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(layerPreferenceKey(), "[]") ?: "[]"
+        try {
+            val array = JSONArray(raw)
+            for (i in 0 until array.length()) {
+                val item = array.getJSONObject(i)
+                val path = item.optString("path")
+                // Do not display stale records if a file has been removed from storage.
+                if (File(path).exists()) {
+                    layers.add(
+                        ImportedLayer(
+                            item.optString("name"),
+                            item.optString("type"),
+                            path,
+                            item.optLong("sizeBytes", File(path).length())
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            layers = mutableListOf()
+        }
+    }
+
+    private fun persistLayerToProject(projectName: String, layer: ImportedLayer) {
+        val preferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val key = "layers_${safeFileName(projectName)}"
+        val array = try { JSONArray(preferences.getString(key, "[]") ?: "[]") } catch (_: Exception) { JSONArray() }
+        array.put(JSONObject().apply {
+            put("name", layer.name)
+            put("type", layer.type)
+            put("path", layer.path)
+            put("sizeBytes", layer.sizeBytes)
+        })
+        preferences.edit().putString(key, array.toString()).apply()
+    }
+
+    private fun persistLayersForProject() {
+        val array = JSONArray()
+        layers.forEach { layer ->
+            array.put(JSONObject().apply {
+                put("name", layer.name)
+                put("type", layer.type)
+                put("path", layer.path)
+                put("sizeBytes", layer.sizeBytes)
+            })
+        }
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(layerPreferenceKey(), array.toString()).apply()
+    }
+
+    private fun layerPreferenceKey() = "layers_${safeFileName(selectedProject)}"
+
+    private fun safeFileName(value: String): String = value
+        .trim()
+        .replace(Regex("[^A-Za-z0-9._-]+"), "_")
+        .trim('_', '.')
+        .ifBlank { "project" }
+        .take(80)
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1024L * 1024L * 1024L -> String.format(Locale.US, "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+        bytes >= 1024L * 1024L -> String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+        else -> "$bytes B"
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    override fun onStart() {
+        super.onStart()
+        mapView.onStart()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        mapView.onResume()
+        if (shouldTrackLocation && hasLocationPermission()) startGps()
+    }
+
+    override fun onPause() {
+        locationManager?.let { manager ->
+            try { manager.removeUpdates(locationListener) } catch (_: Exception) { }
+        }
+        mapView.onPause()
+        super.onPause()
+    }
+
+    override fun onStop() {
+        mapView.onStop()
+        super.onStop()
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        mapView.onLowMemory()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        mapView.onSaveInstanceState(outState)
+    }
+
+    override fun onDestroy() {
+        locationManager?.let { manager ->
+            try { manager.removeUpdates(locationListener) } catch (_: Exception) { }
+        }
+        ioExecutor.shutdown()
+        mapView.onDestroy()
+        super.onDestroy()
+    }
+
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private enum class ImportKind { RASTER, DXF }
+
+    private data class ImportedLayer(
+        val name: String,
+        val type: String,
+        val path: String,
+        val sizeBytes: Long
+    )
+
+    companion object {
+        private const val PREFS_NAME = "finemap_preferences"
+        private const val LOCATION_SOURCE_ID = "current-location-source"
+        private const val LOCATION_LAYER_ID = "current-location-circle"
+    }
+}
+
+<resources>
+    <string name="app_name">FineMap</string>
+</resources>
+
+<resources>
+    <style name="Theme.FineMap" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/map_blue</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/map_green</item>
+        <item name="android:statusBarColor">@color/map_bg</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">@android:color/white</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">@color/map_bg</item>
+    </style>
+</resources>
+
+<resources>
+    <color name="map_dark">#152333</color>
+    <color name="map_blue">#1677FF</color>
+    <color name="map_bg">#F2F5F8</color>
+    <color name="map_text">#162332</color>
+    <color name="map_muted">#667789</color>
+    <color name="map_green">#1C9A68</color>
+</resources>
+
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootFrame"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/map_bg">
+
+    <org.maplibre.android.maps.MapView
+        android:id="@+id/mapView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <LinearLayout
+        android:id="@+id/topOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="vertical"
+        android:paddingStart="14dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="14dp">
+
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardBackgroundColor="#FDFEFFFF"
+            app:cardCornerRadius="18dp"
+            app:cardElevation="5dp"
+            app:strokeColor="#E3EAF0"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:padding="14dp">
+
+                <TextView
+                    android:layout_width="42dp"
+                    android:layout_height="42dp"
+                    android:background="@drawable/logo_bg"
+                    android:gravity="center"
+                    android:text="M"
+                    android:textColor="@android:color/white"
+                    android:textSize="22sp"
+                    android:textStyle="bold" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="11dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="FINEMAP"
+                        android:textColor="@color/map_text"
+                        android:textSize="17sp"
+                        android:textStyle="bold"
+                        android:letterSpacing="0.06" />
+
+                    <TextView
+                        android:id="@+id/tvMapStatus"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="Xarita yuklanmoqda..."
+                        android:textColor="@color/map_muted"
+                        android:textSize="11sp" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tvLayerCountBadge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/badge_bg"
+                    android:paddingStart="10dp"
+                    android:paddingTop="6dp"
+                    android:paddingEnd="10dp"
+                    android:paddingBottom="6dp"
+                    android:text="0 QATLAM"
+                    android:textColor="@color/map_blue"
+                    android:textSize="10sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardArea"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="9dp"
+            android:clickable="true"
+            android:focusable="true"
+            app:cardBackgroundColor="#FDFEFFFF"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="4dp"
+            app:strokeColor="#E3EAF0"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="14dp"
+                android:paddingTop="12dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="12dp">
+
+                <TextView
+                    android:layout_width="38dp"
+                    android:layout_height="38dp"
+                    android:background="@drawable/icon_bg"
+                    android:gravity="center"
+                    android:text="⌖"
+                    android:textColor="@color/map_blue"
+                    android:textSize="25sp" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="10dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="JORIY LOYIHA"
+                        android:textColor="@color/map_muted"
+                        android:textSize="10sp"
+                        android:textStyle="bold"
+                        android:letterSpacing="0.08" />
+
+                    <TextView
+                        android:id="@+id/tvProjectName"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="Olmaliq shahri"
+                        android:textColor="@color/map_text"
+                        android:textSize="15sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvProjectPath"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="O‘zbekiston · Toshkent viloyati"
+                        android:textColor="@color/map_muted"
+                        android:textSize="11sp" />
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="⌄"
+                    android:textColor="@color/map_muted"
+                    android:textSize="22sp" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/bottomOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:paddingStart="14dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="12dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end"
+            android:layout_marginEnd="4dp"
+            android:layout_marginBottom="7dp"
+            android:background="#EFFFFFFF"
+            android:paddingStart="7dp"
+            android:paddingTop="3dp"
+            android:paddingEnd="7dp"
+            android:paddingBottom="3dp"
+            android:text="© OpenStreetMap contributors · OpenFreeMap"
+            android:textColor="#526273"
+            android:textSize="9sp" />
+
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardBackgroundColor="#FDFEFFFF"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="7dp"
+            app:strokeColor="#E3EAF0"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <View
+                        android:id="@+id/viewGpsDot"
+                        android:layout_width="9dp"
+                        android:layout_height="9dp"
+                        android:background="@drawable/gps_dot_off" />
+
+                    <TextView
+                        android:id="@+id/tvGpsStatus"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:text="GPS hali yoqilmagan"
+                        android:textColor="@color/map_text"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvAccuracy"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/badge_bg"
+                        android:paddingStart="8dp"
+                        android:paddingTop="5dp"
+                        android:paddingEnd="8dp"
+                        android:paddingBottom="5dp"
+                        android:text="Aniqlik: —"
+                        android:textColor="@color/map_muted"
+                        android:textSize="10sp" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tvCoordinates"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="7dp"
+                    android:text="Joylashuvni ko‘rish uchun GPS tugmasini bosing"
+                    android:textColor="@color/map_muted"
+                    android:textSize="12sp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnImport"
+                        android:layout_width="0dp"
+                        android:layout_height="48dp"
+                        android:layout_weight="1.05"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:text="＋ Import"
+                        android:textAllCaps="false"
+                        android:textSize="12sp"
+                        app:backgroundTint="@color/map_dark"
+                        app:cornerRadius="13dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnGps"
+                        android:layout_width="0dp"
+                        android:layout_height="48dp"
+                        android:layout_marginStart="7dp"
+                        android:layout_weight="1"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:text="◎ GPS"
+                        android:textAllCaps="false"
+                        android:textSize="12sp"
+                        app:backgroundTint="@color/map_blue"
+                        app:cornerRadius="13dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLayers"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="48dp"
+                        android:layout_marginStart="7dp"
+                        android:layout_weight="1"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:text="▤ Qatlam"
+                        android:textAllCaps="false"
+                        android:textSize="12sp"
+                        app:cornerRadius="13dp"
+                        app:strokeColor="#CDD7E2" />
+                </LinearLayout>
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+    </LinearLayout>
+</FrameLayout>
+
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#1C9A68" />
+</shape>
+
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#EDF4FF" />
+    <corners android:radius="8dp" />
+</shape>
+
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#9AA8B6" />
+</shape>
+
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#EAF2FF" />
+    <corners android:radius="12dp" />
+</shape>
+
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#152333" />
+    <corners android:radius="13dp" />
+</shape>
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:label="FineMap"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.FineMap"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+# Add app-specific ProGuard rules here when a minified release build is introduced.
+
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+
+plugins {
+    id("com.android.application") version "8.8.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+}
+
+org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+android.nonTransitiveRClass=true
+
+# FineMap — Android boshlang‘ich prototipi
+
+**Maqsad:** kon muhandisi uchun hudud bo‘yicha ishlaydigan, kelajakda offline xarita, dron aerofotosyomkasi, DXF poligonlari va GPS joylashuvini birlashtiradigan Android ilova yaratish.
+
+## Hozirgi prototipda ishlaydigan qismlar
+
+- Android uchun Kotlin loyihasi.
+- MapLibre orqali Olmaliq atrofida ochiladigan bazaviy onlayn xarita.
+- Loyiha/hudud tanlash: boshlang‘ich Olmaliq demo loyihasi va yangi loyiha nomini kiritish.
+- Telefon GPS ruxsatini so‘rash, GPS holatini tekshirish, joylashuv va taxminiy aniqlikni ko‘rsatish.
+- GPS nuqtasini xaritada belgilash va kamerani joylashuvga olib borish.
+- `.tif`, `.tiff`, `.ecw` yoki `.dxf` faylini tanlash, loyiha papkasiga nusxalash va import qilingan qatlamlar ro‘yxatida saqlash.
+- Loyiha nomi va import qilingan fayllar ro‘yxatini ilova qayta ochilganda saqlab qolish.
+
+## Hozircha tayyor bo‘lmagan qismlar — muhim
+
+Bu **0.1.0-alpha boshlang‘ich manba kodi**, tayyor ishlab chiqarish ilovasi emas. Hali quyidagi funksiyalar qo‘shilmagan:
+
+1. Tanlangan hudud bazaviy xaritasini offline yuklab olish va internet yo‘q paytda ko‘rsatish.
+2. GeoTIFF/TIFF tasvirini georeferensiyasi bilan xaritada raster qatlam sifatida chizish.
+3. ECW faylini ochish. Android uchun ECW o‘qish kutubxonasi va litsenziya talabi alohida hal qilinadi.
+4. DXF ichidagi poliliniya/poligonlarni o‘qish va xaritada chizish.
+5. Koordinata tizimi (CRS), datum, o‘lchov birligi va transformatsiyani aniqlash.
+6. GPS koordinatasi poligon ichidami yoki tashqarisidami — point-in-polygon hisoblash.
+7. Poligon chegarasiga yaqinlashish ogohlantirishi, GPS trek, masofa/maydon o‘lchash va eksport.
+
+Import tugmasi faylni **saqlaydi**, ammo ushbu versiyada uni hali geospatial qatlam sifatida xaritada ko‘rsatmaydi. Fayl saqlandi degani koordinatalari tekshirildi yoki geodezik jihatdan to‘g‘ri joylashtirildi degani emas.
+
+## Texnologiyalar
+
+- Kotlin + Android Views
+- MapLibre Native Android: bazaviy xarita renderer’i
+- OpenFreeMap Liberty style: boshlang‘ich onlayn fon xaritasi
+- Android LocationManager: telefon GPS’i
+- Android Storage Access Framework: foydalanuvchi tanlagan fayllarni import qilish
+
+## Android Studio’da ishga tushirish
+
+1. Kompyuterga Android Studio va mos Android SDK (API 35) o‘rnating.
+2. `FineMap` papkasini Android Studio’da **Open** orqali oching.
+3. Gradle sinxronizatsiyasi uchun internet kerak bo‘ladi: plaginlar va kutubxonalar yuklab olinadi.
+4. Agar Android Studio Gradle Wrapper fayllari yo‘qligi haqida ogohlantirsa, IDE taklif qilgan usul bilan wrapper yarating (`gradle wrapper --gradle-version 8.10.2`) yoki Android Studio’ning Gradle sozlamalari orqali loyihani sinxronlang. Ushbu paketga wrapper JAR qo‘shilmagan.
+5. Android telefonni USB debugging bilan ulang yoki emulator tanlang.
+6. **Run** tugmasini bosing. Birinchi ishga tushishda internetli aloqa kerak: bazaviy xarita internetdan olinadi.
+
+## Sinov tartibi
+
+1. Ilovani oching — xarita Olmaliq atrofida ko‘rinishi kerak.
+2. `GPS` ni bosing, joylashuv ruxsatini bering va telefonning Location/GPS funksiyasini yoqing.
+3. Joylashuv topilganda koordinata hamda xaritadagi ko‘k nuqta yangilanishini tekshiring.
+4. `Import` orqali test `.tif/.tiff/.ecw` yoki `.dxf` faylini tanlang.
+5. Import yakunida “Qatlam” oynasida nomi va fayl hajmini tekshiring.
+6. Ilovani yopib qayta oching va fayl ro‘yxati saqlanganini tekshiring.
+
+## Geospatial ishlab chiqish uchun keyingi qarorlar
+
+Raster va DXF qatlamlarini xavfsiz qo‘shishdan oldin har bir faylning koordinata tizimi aniqlanishi shart. Geografik koordinatalarni (lat/lon), UTM kabi proyeksiyalangan koordinatalarni va loyiha ichidagi lokal koordinatalarni bir-biriga to‘g‘ri transformatsiya qilish kerak. Bunda GDAL/PROJ yoki ekvivalent sinovdan o‘tgan geospatial kutubxona tanlanadi. ECW Android o‘qish imkoniyati ham alohida tekshiriladi.
+
+**Tavsiya etilgan ketma-ketlik:** (1) Android’da GeoTIFF’ni o‘qish va extent/CRS ko‘rish; (2) DXF poligonlarini qatlamga chiqarish; (3) CRS transformatsiyasi va point-in-polygon testi; (4) offline xarita va katta rasterlar uchun optimallashtirish; (5) RTK GNSS va ogohlantirishlar.
+
+## Rasmiy texnik manbalar
+
+- MapLibre Native Android: https://maplibre.org/maplibre-native/android/
+- OpenFreeMap: https://openfreemap.org/
+- GDAL Android build ma’lumoti: https://gdal.org/en/stable/download.html
+- Hexagon ECW SDK litsenziyalash: https://bynder.hexagon.com/m/5af86a8895f6696f/original/Hexagon_GSP_ERDAS_ECW_JP2_SDK_5_5_User_Guide.pdf
+
+# FineMap texnik yo‘l xaritasi
+
+## 0.1 — Boshlang‘ich prototip
+- [x] Android loyiha tuzilmasi
+- [x] Bazaviy onlayn xarita oynasi
+- [x] Hudud/loyiha tanlash va nomini saqlash
+- [x] GPS ruxsati va joriy joylashuv belgisi
+- [x] TIFF/ECW/DXF fayllarini tanlash va loyiha papkasiga nusxalash
+- [x] Import ro‘yxatini saqlash
+- [ ] Qurilmada build va real GPS sinovi — Android SDK/telefon kerak
+
+## 0.2 — Raster qatlam
+- [ ] GeoTIFF metadata va CRS ni aniqlash
+- [ ] Raster extent va piksel o‘lchamlarini o‘qish
+- [ ] Katta raster uchun piramida/overviews yoki tiling
+- [ ] Raster layerni xaritada ko‘rsatish
+- [ ] Loyiha ichida qatlam ko‘rinishini yoqish/o‘chirish
+- [ ] Oddiy TIFF uchun georeferensiya faylini (masalan, world file + projection) tekshirish
+
+## 0.3 — DXF va geometriya
+- [ ] DXF entity/layer ro‘yxatini o‘qish
+- [ ] Yopiq polyline/poligonlarni aniqlash
+- [ ] DXF chizma birliklari va koordinata tizimini ko‘rsatish
+- [ ] CRS tanlash va koordinata transformatsiyasi
+- [ ] Poligonni xaritada chizish
+- [ ] GPS nuqtasi poligon ichida ekanini hisoblash
+- [ ] Chegara yaqinida GPS aniqligi bo‘yicha ogohlantirish
+
+## 0.4 — Offline va dala ishlar
+- [ ] Tanlangan bazaviy xarita hududini offline yuklab olish
+- [ ] Import qilingan raster va DXF ma’lumotlarini to‘liq offline ishlatish
+- [ ] Masofa/maydon o‘lchash
+- [ ] GPS trek yozish, CSV/GPX/KML eksporti
+- [ ] Nuqta izohi va foto biriktirish
+- [ ] Ilova ichida fayl hajmi va bo‘sh xotira nazorati
+
+## 0.5 — Ishonchlilik va chiqarish
+- [ ] Real kon hududidagi test dataset bilan sinash
+- [ ] Turli CRS va katta fayl sinovlari
+- [ ] GPS aniqligi va noaniqlik indikatorlari
+- [ ] Ma’lumotlarni zaxiralash va versiyalash
+- [ ] Android imzolangan release APK va qurilma sinovi
+
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+ dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "FineMap"
+include(":app")
+ of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+
+      # Runs a single command using the runners shell
+      - name: Run a one-line script
+        run: echo Hello, world!
+
+      # Runs a set of commands using the runners shell
+      - name: Run a multi-line script
+        run: |
+          echo Add other actions to build,
+          echo test, and deploy your project.
